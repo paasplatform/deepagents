@@ -28,6 +28,7 @@ from deepagents.backends.protocol import (
     SandboxBackendProtocol,
     WriteResult,
 )
+from deepagents.backends.types import FileData, FilesystemState
 from deepagents.backends.utils import (
     format_content_with_line_numbers,
     format_grep_matches,
@@ -55,56 +56,6 @@ READ_FILE_TRUNCATION_MSG = (
 # Using 4 chars per token as a conservative approximation (actual ratio varies by content)
 # This errs on the high side to avoid premature eviction of content that might fit
 NUM_CHARS_PER_TOKEN = 4
-
-
-class FileData(TypedDict):
-    """Data structure for storing file contents with metadata."""
-
-    content: list[str]
-    """Lines of the file."""
-
-    created_at: str
-    """ISO 8601 timestamp of file creation."""
-
-    modified_at: str
-    """ISO 8601 timestamp of last modification."""
-
-
-def _file_data_reducer(left: dict[str, FileData] | None, right: dict[str, FileData | None]) -> dict[str, FileData]:
-    """Merge file updates with support for deletions.
-
-    This reducer enables file deletion by treating `None` values in the right
-    dictionary as deletion markers. It's designed to work with LangGraph's
-    state management where annotated reducers control how state updates merge.
-
-    Args:
-        left: Existing files dictionary. May be `None` during initialization.
-        right: New files dictionary to merge. Files with `None` values are
-            treated as deletion markers and removed from the result.
-
-    Returns:
-        Merged dictionary where right overwrites left for matching keys,
-        and `None` values in right trigger deletions.
-
-    Example:
-        ```python
-        existing = {"/file1.txt": FileData(...), "/file2.txt": FileData(...)}
-        updates = {"/file2.txt": None, "/file3.txt": FileData(...)}
-        result = file_data_reducer(existing, updates)
-        # Result: {"/file1.txt": FileData(...), "/file3.txt": FileData(...)}
-        ```
-    """
-    if left is None:
-        return {k: v for k, v in right.items() if v is not None}
-
-    result = {**left}
-    for key, value in right.items():
-        if value is None:
-            result.pop(key, None)
-        else:
-            result[key] = value
-    return result
-
 
 def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) -> str:
     r"""Validate and normalize file path for security.
@@ -161,14 +112,6 @@ def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) 
         raise ValueError(msg)
 
     return normalized
-
-
-class FilesystemState(AgentState):
-    """State for the filesystem middleware."""
-
-    files: Annotated[NotRequired[dict[str, FileData]], _file_data_reducer]
-    """Files in the filesystem."""
-
 
 LIST_FILES_TOOL_DESCRIPTION = """Lists all files in a directory.
 
@@ -494,7 +437,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Synchronous wrapper for ls tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(path)
-            infos = resolved_backend.ls_info(validated_path)
+            infos = resolved_backend.ls_info(validated_path, runtime)
             paths = [fi.get("path", "") for fi in infos]
             result = truncate_if_too_long(paths)
             return str(result)
@@ -506,7 +449,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Asynchronous wrapper for ls tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(path)
-            infos = await resolved_backend.als_info(validated_path)
+            infos = await resolved_backend.als_info(validated_path, runtime)
             paths = [fi.get("path", "") for fi in infos]
             result = truncate_if_too_long(paths)
             return str(result)
@@ -532,7 +475,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Synchronous wrapper for read_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            result = resolved_backend.read(validated_path, offset=offset, limit=limit)
+            result = resolved_backend.read(validated_path, offset=offset, limit=limit, runtime=runtime)
 
             lines = result.splitlines(keepends=True)
             if len(lines) > limit:
@@ -558,7 +501,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Asynchronous wrapper for read_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            result = await resolved_backend.aread(validated_path, offset=offset, limit=limit)
+            result = await resolved_backend.aread(validated_path, offset=offset, limit=limit, runtime=runtime)
 
             lines = result.splitlines(keepends=True)
             if len(lines) > limit:
@@ -594,7 +537,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Synchronous wrapper for write_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            res: WriteResult = resolved_backend.write(validated_path, content)
+            res: WriteResult = resolved_backend.write(validated_path, content, runtime)
             if res.error:
                 return res.error
             # If backend returns state update, wrap into Command with ToolMessage
@@ -620,7 +563,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Asynchronous wrapper for write_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            res: WriteResult = await resolved_backend.awrite(validated_path, content)
+            res: WriteResult = await resolved_backend.awrite(validated_path, content, runtime)
             if res.error:
                 return res.error
             # If backend returns state update, wrap into Command with ToolMessage
@@ -660,7 +603,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Synchronous wrapper for edit_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            res: EditResult = resolved_backend.edit(validated_path, old_string, new_string, replace_all=replace_all)
+            res: EditResult = resolved_backend.edit(validated_path, old_string, new_string, replace_all=replace_all, runtime=runtime)
             if res.error:
                 return res.error
             if res.files_update is not None:
@@ -688,7 +631,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Asynchronous wrapper for edit_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            res: EditResult = await resolved_backend.aedit(validated_path, old_string, new_string, replace_all=replace_all)
+            res: EditResult = await resolved_backend.aedit(validated_path, old_string, new_string, replace_all=replace_all, runtime=runtime)
             if res.error:
                 return res.error
             if res.files_update is not None:
@@ -723,7 +666,7 @@ class FilesystemMiddleware(AgentMiddleware):
         ) -> str:
             """Synchronous wrapper for glob tool."""
             resolved_backend = self._get_backend(runtime)
-            infos = resolved_backend.glob_info(pattern, path=path)
+            infos = resolved_backend.glob_info(pattern, path=path, runtime=runtime)
             paths = [fi.get("path", "") for fi in infos]
             result = truncate_if_too_long(paths)
             return str(result)
@@ -735,7 +678,7 @@ class FilesystemMiddleware(AgentMiddleware):
         ) -> str:
             """Asynchronous wrapper for glob tool."""
             resolved_backend = self._get_backend(runtime)
-            infos = await resolved_backend.aglob_info(pattern, path=path)
+            infos = await resolved_backend.aglob_info(pattern, path=path, runtime=runtime)
             paths = [fi.get("path", "") for fi in infos]
             result = truncate_if_too_long(paths)
             return str(result)
@@ -763,7 +706,7 @@ class FilesystemMiddleware(AgentMiddleware):
         ) -> str:
             """Synchronous wrapper for grep tool."""
             resolved_backend = self._get_backend(runtime)
-            raw = resolved_backend.grep_raw(pattern, path=path, glob=glob)
+            raw = resolved_backend.grep_raw(pattern, path=path, glob=glob, runtime=runtime)
             if isinstance(raw, str):
                 return raw
             formatted = format_grep_matches(raw, output_mode)
@@ -781,7 +724,7 @@ class FilesystemMiddleware(AgentMiddleware):
         ) -> str:
             """Asynchronous wrapper for grep tool."""
             resolved_backend = self._get_backend(runtime)
-            raw = await resolved_backend.agrep_raw(pattern, path=path, glob=glob)
+            raw = await resolved_backend.agrep_raw(pattern, path=path, glob=glob, runtime=runtime)
             if isinstance(raw, str):
                 return raw
             formatted = format_grep_matches(raw, output_mode)

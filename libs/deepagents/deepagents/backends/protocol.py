@@ -14,6 +14,8 @@ from typing import Any, Literal, NotRequired, TypeAlias
 from langchain.tools import ToolRuntime
 from typing_extensions import TypedDict
 
+from deepagents.backends.types import FilesystemState
+
 FileOperationError = Literal[
     "file_not_found",  # Download: file doesn't exist
     "permission_denied",  # Both: access denied
@@ -172,7 +174,7 @@ class BackendProtocol(abc.ABC):
     }
     """
 
-    def ls_info(self, path: str) -> list["FileInfo"]:
+    def ls_info(self, path: str, runtime: ToolRuntime[None, FilesystemState]) -> list["FileInfo"]:
         """List all files in a directory with metadata.
 
         Args:
@@ -187,7 +189,7 @@ class BackendProtocol(abc.ABC):
             - `modified_at` (optional): ISO 8601 timestamp
         """
 
-    async def als_info(self, path: str) -> list["FileInfo"]:
+    async def als_info(self, path: str, runtime: ToolRuntime[None, FilesystemState]) -> list["FileInfo"]:
         """Async version of ls_info."""
         return await asyncio.to_thread(self.ls_info, path)
 
@@ -196,6 +198,7 @@ class BackendProtocol(abc.ABC):
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
+        runtime: ToolRuntime[None, FilesystemState] = None
     ) -> str:
         """Read file content with line numbers.
 
@@ -223,6 +226,7 @@ class BackendProtocol(abc.ABC):
         file_path: str,
         offset: int = 0,
         limit: int = 2000,
+        runtime: ToolRuntime[None, FilesystemState] = None,
     ) -> str:
         """Async version of read."""
         return await asyncio.to_thread(self.read, file_path, offset, limit)
@@ -232,6 +236,7 @@ class BackendProtocol(abc.ABC):
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        runtime: ToolRuntime[None, FilesystemState] = None,
     ) -> list["GrepMatch"] | str:
         """Search for a literal text pattern in files.
 
@@ -272,11 +277,12 @@ class BackendProtocol(abc.ABC):
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        runtime: ToolRuntime[None, FilesystemState] = None,
     ) -> list["GrepMatch"] | str:
         """Async version of grep_raw."""
         return await asyncio.to_thread(self.grep_raw, pattern, path, glob)
 
-    def glob_info(self, pattern: str, path: str = "/") -> list["FileInfo"]:
+    def glob_info(self, pattern: str, path: str = "/", runtime: ToolRuntime[None, FilesystemState] = None) -> list["FileInfo"]:
         """Find files matching a glob pattern.
 
         Args:
@@ -294,7 +300,7 @@ class BackendProtocol(abc.ABC):
             list of FileInfo
         """
 
-    async def aglob_info(self, pattern: str, path: str = "/") -> list["FileInfo"]:
+    async def aglob_info(self, pattern: str, path: str = "/", runtime: ToolRuntime[None, FilesystemState] = None) -> list["FileInfo"]:
         """Async version of glob_info."""
         return await asyncio.to_thread(self.glob_info, pattern, path)
 
@@ -302,6 +308,7 @@ class BackendProtocol(abc.ABC):
         self,
         file_path: str,
         content: str,
+        runtime: ToolRuntime[None, FilesystemState] = None
     ) -> WriteResult:
         """Write content to a new file in the filesystem, error if file exists.
 
@@ -318,6 +325,7 @@ class BackendProtocol(abc.ABC):
         self,
         file_path: str,
         content: str,
+        runtime: ToolRuntime[None, FilesystemState] = None
     ) -> WriteResult:
         """Async version of write."""
         return await asyncio.to_thread(self.write, file_path, content)
@@ -328,6 +336,7 @@ class BackendProtocol(abc.ABC):
         old_string: str,
         new_string: str,
         replace_all: bool = False,
+        runtime: ToolRuntime[None, FilesystemState] = None
     ) -> EditResult:
         """Perform exact string replacements in an existing file.
 
@@ -350,11 +359,12 @@ class BackendProtocol(abc.ABC):
         old_string: str,
         new_string: str,
         replace_all: bool = False,
+        runtime: ToolRuntime[None, FilesystemState] = None
     ) -> EditResult:
         """Async version of edit."""
         return await asyncio.to_thread(self.edit, file_path, old_string, new_string, replace_all)
 
-    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+    def upload_files(self, files: list[tuple[str, bytes]], runtime: ToolRuntime[None, FilesystemState]) -> list[FileUploadResponse]:
         """Upload multiple files to the sandbox.
 
         This API is designed to allow developers to use it either directly or
@@ -379,11 +389,11 @@ class BackendProtocol(abc.ABC):
             ```
         """
 
-    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+    async def aupload_files(self, files: list[tuple[str, bytes]], runtime: ToolRuntime[None, FilesystemState]) -> list[FileUploadResponse]:
         """Async version of upload_files."""
         return await asyncio.to_thread(self.upload_files, files)
 
-    def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+    def download_files(self, paths: list[str], runtime: ToolRuntime[None, FilesystemState]) -> list[FileDownloadResponse]:
         """Download multiple files from the sandbox.
 
         This API is designed to allow developers to use it either directly or
@@ -398,7 +408,7 @@ class BackendProtocol(abc.ABC):
             Check the error field to determine success/failure per file.
         """
 
-    async def adownload_files(self, paths: list[str]) -> list[FileDownloadResponse]:
+    async def adownload_files(self, paths: list[str], runtime: ToolRuntime[None, FilesystemState]) -> list[FileDownloadResponse]:
         """Async version of download_files."""
         return await asyncio.to_thread(self.download_files, paths)
 
