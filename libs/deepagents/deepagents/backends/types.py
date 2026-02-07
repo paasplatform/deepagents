@@ -3,10 +3,6 @@ from typing import Annotated, NotRequired
 from langchain.agents.middleware.types import AgentState
 from typing_extensions import TypedDict
 
-from deepagents.backends.protocol import (
-    BACKEND_TYPES as BACKEND_TYPES  # Re-export type here for backwards compatibility,
-)
-
 class FileData(TypedDict):
     """Data structure for storing file contents with metadata."""
 
