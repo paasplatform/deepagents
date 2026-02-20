@@ -3,6 +3,8 @@
 This module provides a base class that implements all SandboxBackendProtocol
 methods using shell commands executed via execute(). Concrete implementations
 only need to implement the execute() method.
+
+It also defines the BaseSandbox implementation used by the CLI sandboxes.
 """
 
 from __future__ import annotations
@@ -193,16 +195,20 @@ class BaseSandbox(SandboxBackendProtocol, ABC):
     def execute(
         self,
         command: str,
+        *,
+        timeout: int | None = None,
     ) -> ExecuteResponse:
         """Execute a command in the sandbox and return ExecuteResponse.
 
         Args:
             command: Full shell command string to execute.
+            timeout: Maximum time in seconds to wait for the command to complete.
+
+                If None, uses the backend's default timeout.
 
         Returns:
-            ExecuteResponse with combined output, exit code, optional signal, and truncation flag.
+            ExecuteResponse with combined output, exit code, and truncation flag.
         """
-        ...
 
     def ls_info(self, path: str) -> list[FileInfo]:
         """Structured listing with file metadata using os.scandir."""
@@ -288,7 +294,7 @@ except PermissionError:
         file_path: str,
         old_string: str,
         new_string: str,
-        replace_all: bool = False,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
     ) -> EditResult:
         """Edit a file by replacing string occurrences. Returns EditResult."""
         # Create JSON payload with file path, old string, and new string
@@ -351,7 +357,7 @@ except PermissionError:
         for line in output.split("\n"):
             # Format is: path:line_number:text
             parts = line.split(":", 2)
-            if len(parts) >= 3:
+            if len(parts) >= 3:  # noqa: PLR2004  # Grep output field count
                 matches.append(
                     {
                         "path": parts[0],

@@ -1,11 +1,13 @@
 """Tests for autocomplete fuzzy search functionality."""
 
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
 
 from deepagents_cli.widgets.autocomplete import (
     SLASH_COMMANDS,
+    CompletionController,
     FuzzyFileController,
     MultiCompletionManager,
     SlashCommandController,
@@ -59,6 +61,18 @@ class TestFuzzyScore:
         short_score = _fuzzy_score("test", "test.py")
         long_score = _fuzzy_score("test", "very/long/path/to/test.py")
         assert short_score > long_score
+
+    def test_backslash_normalization(self):
+        """Backslash-separated paths score the same as forward-slash paths."""
+        forward = _fuzzy_score("helper", "src/utils/helper.py")
+        backward = _fuzzy_score("helper", "src\\utils\\helper.py")
+        assert backward == forward
+        assert backward > 100  # Should be a strong filename match
+
+    def test_mixed_separator_normalization(self):
+        """Mixed forward/backslash paths are normalized before scoring."""
+        score = _fuzzy_score("helper", "src/utils\\helper.py")
+        assert score > 100  # Should extract filename correctly
 
 
 class TestFuzzySearch:
@@ -241,6 +255,28 @@ class TestSlashCommandController:
 
         mock_view.clear_completion_suggestions.assert_called()
 
+    def test_suggestions_return_after_reset(self, controller, mock_view):
+        """Suggestions reappear when text is re-entered after a reset."""
+        controller.on_text_changed("/", 1)
+        mock_view.render_completion_suggestions.assert_called()
+
+        controller.reset()
+        mock_view.reset_mock()
+
+        # Re-entering "/" should show suggestions again
+        controller.on_text_changed("/", 1)
+        mock_view.render_completion_suggestions.assert_called()
+        suggestions = mock_view.render_completion_suggestions.call_args[0][0]
+        assert len(suggestions) == len(SLASH_COMMANDS)
+
+    @pytest.mark.usefixtures("mock_view")
+    def test_double_reset_is_safe(self, controller):
+        """Calling reset twice does not raise or double-clear."""
+        controller.on_text_changed("/", 1)
+        controller.reset()
+        # Second reset should be a no-op (suggestions already empty)
+        controller.reset()
+
 
 class TestFuzzyFileControllerCanHandle:
     """Tests for FuzzyFileController.can_handle method."""
@@ -300,7 +336,11 @@ class TestMultiCompletionManager:
         """Create a MultiCompletionManager with both controllers."""
         slash_ctrl = SlashCommandController(SLASH_COMMANDS, mock_view)
         file_ctrl = FuzzyFileController(mock_view, cwd=tmp_path)
-        return MultiCompletionManager([slash_ctrl, file_ctrl])
+        # Cast needed: lists are invariant, so the inferred type
+        # list[SlashCommandController | FuzzyFileController] won't match
+        # list[CompletionController] even though both satisfy the protocol.
+        controllers = cast("list[CompletionController]", [slash_ctrl, file_ctrl])
+        return MultiCompletionManager(controllers)
 
     def test_activates_slash_controller_for_slash(self, manager):
         """Activates slash controller for / prefix."""
@@ -330,5 +370,26 @@ class TestMultiCompletionManager:
     def test_reset_clears_active(self, manager):
         """Reset clears active controller."""
         manager.on_text_changed("/cmd", 4)
+        manager.reset()
+        assert manager._active is None
+
+    def test_reactivates_after_reset(self, manager, mock_view):
+        """Controller reactivates for new input after a full reset."""
+        manager.on_text_changed("/", 1)
+        assert isinstance(manager._active, SlashCommandController)
+
+        manager.reset()
+        assert manager._active is None
+        mock_view.reset_mock()
+
+        # Typing "/" again should reactivate the slash controller
+        manager.on_text_changed("/", 1)
+        assert isinstance(manager._active, SlashCommandController)
+        mock_view.render_completion_suggestions.assert_called()
+
+    def test_double_reset_is_safe(self, manager):
+        """Calling reset when already inactive is a no-op."""
+        manager.on_text_changed("/cmd", 4)
+        manager.reset()
         manager.reset()
         assert manager._active is None

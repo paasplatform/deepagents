@@ -263,23 +263,22 @@ async def test_store_backend_aupload_adownload():
 
 
 async def test_store_backend_agrep_invalid_regex():
-    """Test async grep with invalid regex pattern."""
+    """Test async grep with special characters (literal search, not regex)."""
     rt = make_runtime()
     be = StoreBackend(rt)
 
     res = await be.awrite("/test.txt", "some content")
     assert res.error is None
 
-    # Invalid regex should return error string
+    # Special characters are treated literally, not regex
     result = await be.agrep_raw("[invalid", path="/")
-    assert isinstance(result, str)
-    assert "Invalid regex" in result or "error" in result.lower()
+    assert isinstance(result, list)  # Returns empty list, not error
 
 
 async def test_store_backend_intercept_large_tool_result_async():
     """Test that StoreBackend properly handles large tool result interception in async context."""
     rt = make_runtime()
-    middleware = FilesystemMiddleware(backend=lambda r: StoreBackend(r), tool_token_limit_before_evict=1000)
+    middleware = FilesystemMiddleware(backend=StoreBackend, tool_token_limit_before_evict=1000)
 
     large_content = "y" * 5000
     tool_message = ToolMessage(content=large_content, tool_call_id="test_456")
@@ -297,7 +296,7 @@ async def test_store_backend_intercept_large_tool_result_async():
 async def test_store_backend_aintercept_large_tool_result_async():
     """Test async intercept path uses async store methods (fixes InvalidStateError with BatchedStore)."""
     rt = make_runtime()
-    middleware = FilesystemMiddleware(backend=lambda r: StoreBackend(r), tool_token_limit_before_evict=1000)
+    middleware = FilesystemMiddleware(backend=StoreBackend, tool_token_limit_before_evict=1000)
 
     large_content = "z" * 5000
     tool_message = ToolMessage(content=large_content, tool_call_id="test_async_789", name="example_tool")

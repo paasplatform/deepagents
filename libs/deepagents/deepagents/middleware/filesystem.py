@@ -1,20 +1,23 @@
 """Middleware for providing filesystem tools to an agent."""
 # ruff: noqa: E501
 
-import os
-import re
-from collections.abc import Awaitable, Callable, Sequence
-from typing import Annotated, Literal, NotRequired
+import base64
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Annotated, Any, Literal, NotRequired, cast
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     AgentState,
+    ContextT,
     ModelRequest,
     ModelResponse,
+    ResponseT,
 )
 from langchain.tools import ToolRuntime
 from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.messages import ToolMessage
+from langchain_core.messages.content import create_image_block
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.types import Command
 from typing_extensions import TypedDict
@@ -34,6 +37,7 @@ from deepagents.backends.utils import (
     format_grep_matches,
     sanitize_tool_call_id,
     truncate_if_too_long,
+    validate_path,
 )
 from deepagents.middleware._utils import append_to_system_message
 
@@ -41,6 +45,15 @@ EMPTY_CONTENT_WARNING = "System reminder: File exists but has empty contents"
 LINE_NUMBER_WIDTH = 6
 DEFAULT_READ_OFFSET = 0
 DEFAULT_READ_LIMIT = 100
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+IMAGE_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
 
 # Template for truncation message in read_file
 # {file_path} will be filled in at runtime
@@ -56,6 +69,56 @@ READ_FILE_TRUNCATION_MSG = (
 # Using 4 chars per token as a conservative approximation (actual ratio varies by content)
 # This errs on the high side to avoid premature eviction of content that might fit
 NUM_CHARS_PER_TOKEN = 4
+
+
+class FileData(TypedDict):
+    """Data structure for storing file contents with metadata."""
+
+    content: list[str]
+    """Lines of the file."""
+
+    created_at: str
+    """ISO 8601 timestamp of file creation."""
+
+    modified_at: str
+    """ISO 8601 timestamp of last modification."""
+
+
+def _file_data_reducer(left: dict[str, FileData] | None, right: dict[str, FileData | None]) -> dict[str, FileData]:
+    """Merge file updates with support for deletions.
+
+    This reducer enables file deletion by treating `None` values in the right
+    dictionary as deletion markers. It's designed to work with LangGraph's
+    state management where annotated reducers control how state updates merge.
+
+    Args:
+        left: Existing files dictionary. May be `None` during initialization.
+        right: New files dictionary to merge. Files with `None` values are
+            treated as deletion markers and removed from the result.
+
+    Returns:
+        Merged dictionary where right overwrites left for matching keys,
+        and `None` values in right trigger deletions.
+
+    Example:
+        ```python
+        existing = {"/file1.txt": FileData(...), "/file2.txt": FileData(...)}
+        updates = {"/file2.txt": None, "/file3.txt": FileData(...)}
+        result = file_data_reducer(existing, updates)
+        # Result: {"/file1.txt": FileData(...), "/file3.txt": FileData(...)}
+        ```
+    """
+    if left is None:
+        return {k: v for k, v in right.items() if v is not None}
+
+    result = {**left}
+    for key, value in right.items():
+        if value is None:
+            result.pop(key, None)
+        else:
+            result[key] = value
+    return result
+
 
 def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) -> str:
     r"""Validate and normalize file path for security.
@@ -113,6 +176,14 @@ def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) 
 
     return normalized
 
+
+class FilesystemState(AgentState):
+    """State for the filesystem middleware."""
+
+    files: Annotated[NotRequired[dict[str, FileData]], _file_data_reducer]
+    """Files in the filesystem."""
+
+
 LIST_FILES_TOOL_DESCRIPTION = """Lists all files in a directory.
 
 This is useful for exploring the filesystem and finding the right file to read or edit.
@@ -133,6 +204,13 @@ Usage:
 - Lines longer than 5,000 characters will be split into multiple lines with continuation markers (e.g., 5.1, 5.2, etc.). When you specify a limit, these continuation lines count towards the limit.
 - You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.
 - If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.
+- Image files (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) are returned as multimodal image content blocks (see https://docs.langchain.com/oss/python/langchain/messages#multimodal).
+
+For image tasks:
+- Use `read_file(file_path=...)` for `.png/.jpg/.jpeg/.gif/.webp`
+- Do NOT use `offset`/`limit` for images (pagination is text-only)
+- If image details were compacted from history, call `read_file` again on the same path
+
 - You should ALWAYS make sure a file has been read before editing it."""
 
 EDIT_FILE_TOOL_DESCRIPTION = """Performs exact string replacements in files.
@@ -164,11 +242,13 @@ Examples:
 GREP_TOOL_DESCRIPTION = """Search for a text pattern across files.
 
 Searches for literal text (not regex) and returns matching files or content based on output_mode.
+Special characters like parentheses, brackets, pipes, etc. are treated as literal characters, not regex operators.
 
 Examples:
 - Search all files: `grep(pattern="TODO")`
 - Search Python files only: `grep(pattern="import", glob="*.py")`
-- Show matching lines: `grep(pattern="error", output_mode="content")`"""
+- Show matching lines: `grep(pattern="error", output_mode="content")`
+- Search for code with special chars: `grep(pattern="def __init__(self):")`"""
 
 EXECUTE_TOOL_DESCRIPTION = """Executes a shell command in an isolated sandbox environment.
 
@@ -191,6 +271,7 @@ Usage notes:
   - Commands run in an isolated sandbox environment
   - Returns combined stdout/stderr output with exit code
   - If the output is very large, it may be truncated
+  - For long-running commands, use the optional timeout parameter to override the default timeout (e.g., execute(command="make build", timeout=300))
   - VERY IMPORTANT: You MUST avoid using search commands like find and grep. Instead use the grep, glob tools to search. You MUST avoid read tools like cat, head, tail, and use read_file to read files.
   - When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines (newlines are ok in quoted strings)
     - Use '&&' when commands depend on each other (e.g., "mkdir dir && cd dir")
@@ -202,6 +283,7 @@ Examples:
     - execute(command="pytest /foo/bar/tests")
     - execute(command="python /path/to/script.py")
     - execute(command="npm install && npm test")
+    - execute(command="make build", timeout=300)
 
   Bad examples (avoid these):
     - execute(command="cd /foo/bar && pytest tests")  # Use absolute path instead
@@ -212,7 +294,16 @@ Examples:
 Note: This tool is only available if the backend supports execution (SandboxBackendProtocol).
 If execution is not supported, the tool will return an error message."""
 
-FILESYSTEM_SYSTEM_PROMPT = """## Filesystem Tools `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`
+FILESYSTEM_SYSTEM_PROMPT = """## Following Conventions
+
+- Read files before editing — understand existing content before making changes
+- Mimic existing style, naming conventions, and patterns
+
+## Tool Usage and File Reading
+
+Follow the tool docs for the available tools. In particular, for filesystem tools, use pagination (offset/limit) when reading large files.
+
+## Filesystem Tools `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`
 
 You have access to a filesystem which you can interact with using these tools.
 All file paths must start with a /.
@@ -284,13 +375,12 @@ TOOLS_EXCLUDED_FROM_EVICTION = (
 
 
 TOO_LARGE_TOOL_MSG = """Tool result too large, the result of this tool call {tool_call_id} was saved in the filesystem at this path: {file_path}
-You can read the result from the filesystem by using the read_file tool, but make sure to only read part of the result at a time.
-You can do this by specifying an offset and limit in the read_file tool call.
-For example, to read the first 100 lines, you can use the read_file tool with offset=0 and limit=100.
 
-Here is a preview showing the head and tail of the result (lines of the form
-... [N lines truncated] ...
-indicate omitted lines in the middle of the content):
+You can read the result from the filesystem by using the read_file tool, but make sure to only read part of the result at a time.
+
+You can do this by specifying an offset and limit in the read_file tool call. For example, to read the first 100 lines, you can use the read_file tool with offset=0 and limit=100.
+
+Here is a preview showing the head and tail of the result (lines of the form `... [N lines truncated] ...` indicate omitted lines in the middle of the content):
 
 {content_sample}
 """
@@ -325,7 +415,7 @@ def _create_content_preview(content_str: str, *, head_lines: int = 5, tail_lines
     return head_sample + truncation_notice + tail_sample
 
 
-class FilesystemMiddleware(AgentMiddleware):
+class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]):
     """Middleware for providing filesystem and optional execution tools to an agent.
 
     This middleware adds filesystem tools to the agent: `ls`, `read_file`, `write_file`,
@@ -385,6 +475,7 @@ class FilesystemMiddleware(AgentMiddleware):
         system_prompt: str | None = None,
         custom_tool_descriptions: dict[str, str] | None = None,
         tool_token_limit_before_evict: int | None = 20000,
+        max_execute_timeout: int = 3600,
     ) -> None:
         """Initialize the filesystem middleware.
 
@@ -394,14 +485,26 @@ class FilesystemMiddleware(AgentMiddleware):
             system_prompt: Optional custom system prompt override.
             custom_tool_descriptions: Optional custom tool descriptions override.
             tool_token_limit_before_evict: Optional token limit before evicting a tool result to the filesystem.
+            max_execute_timeout: Maximum allowed value in seconds for per-command timeout
+                overrides on the execute tool.
+
+                Defaults to 3600 seconds (1 hour). Any per-command timeout
+                exceeding this value will be rejected with an error message.
+
+        Raises:
+            ValueError: If `max_execute_timeout` is not positive.
         """
+        if max_execute_timeout <= 0:
+            msg = f"max_execute_timeout must be positive, got {max_execute_timeout}"
+            raise ValueError(msg)
         # Use provided backend or default to StateBackend factory
-        self.backend = backend if backend is not None else (lambda rt: StateBackend(rt))
+        self.backend = backend if backend is not None else (StateBackend)
 
         # Store configuration (private - internal implementation details)
         self._custom_system_prompt = system_prompt
         self._custom_tool_descriptions = custom_tool_descriptions or {}
         self._tool_token_limit_before_evict = tool_token_limit_before_evict
+        self._max_execute_timeout = max_execute_timeout
 
         self.tools = [
             self._create_ls_tool(),
@@ -413,7 +516,7 @@ class FilesystemMiddleware(AgentMiddleware):
             self._create_execute_tool(),
         ]
 
-    def _get_backend(self, runtime: ToolRuntime) -> BackendProtocol:
+    def _get_backend(self, runtime: ToolRuntime[Any, Any]) -> BackendProtocol:
         """Get the resolved backend instance from backend or factory.
 
         Args:
@@ -437,7 +540,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Synchronous wrapper for ls tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(path)
-            infos = resolved_backend.ls_info(validated_path, runtime)
+            infos = resolved_backend.ls_info(validated_path)
             paths = [fi.get("path", "") for fi in infos]
             result = truncate_if_too_long(paths)
             return str(result)
@@ -449,7 +552,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Asynchronous wrapper for ls tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(path)
-            infos = await resolved_backend.als_info(validated_path, runtime)
+            infos = await resolved_backend.als_info(validated_path)
             paths = [fi.get("path", "") for fi in infos]
             result = truncate_if_too_long(paths)
             return str(result)
@@ -461,7 +564,7 @@ class FilesystemMiddleware(AgentMiddleware):
             coroutine=async_ls,
         )
 
-    def _create_read_file_tool(self) -> BaseTool:
+    def _create_read_file_tool(self) -> BaseTool:  # noqa: C901
         """Create the read_file tool."""
         tool_description = self._custom_tool_descriptions.get("read_file") or READ_FILE_TOOL_DESCRIPTION
         token_limit = self._tool_token_limit_before_evict
@@ -471,11 +574,11 @@ class FilesystemMiddleware(AgentMiddleware):
             runtime: ToolRuntime[None, FilesystemState],
             offset: Annotated[int, "Line number to start reading from (0-indexed). Use for pagination of large files."] = DEFAULT_READ_OFFSET,
             limit: Annotated[int, "Maximum number of lines to read. Use for pagination of large files."] = DEFAULT_READ_LIMIT,
-        ) -> str:
+        ) -> ToolMessage | str:
             """Synchronous wrapper for read_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            result = resolved_backend.read(validated_path, offset=offset, limit=limit, runtime=runtime)
+            result = resolved_backend.read(validated_path, offset=offset, limit=limit)
 
             lines = result.splitlines(keepends=True)
             if len(lines) > limit:
@@ -497,11 +600,11 @@ class FilesystemMiddleware(AgentMiddleware):
             runtime: ToolRuntime[None, FilesystemState],
             offset: Annotated[int, "Line number to start reading from (0-indexed). Use for pagination of large files."] = DEFAULT_READ_OFFSET,
             limit: Annotated[int, "Maximum number of lines to read. Use for pagination of large files."] = DEFAULT_READ_LIMIT,
-        ) -> str:
+        ) -> ToolMessage | str:
             """Asynchronous wrapper for read_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            result = await resolved_backend.aread(validated_path, offset=offset, limit=limit, runtime=runtime)
+            result = await resolved_backend.aread(validated_path, offset=offset, limit=limit)
 
             lines = result.splitlines(keepends=True)
             if len(lines) > limit:
@@ -537,7 +640,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Synchronous wrapper for write_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            res: WriteResult = resolved_backend.write(validated_path, content, runtime)
+            res: WriteResult = resolved_backend.write(validated_path, content)
             if res.error:
                 return res.error
             # If backend returns state update, wrap into Command with ToolMessage
@@ -563,7 +666,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Asynchronous wrapper for write_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            res: WriteResult = await resolved_backend.awrite(validated_path, content, runtime)
+            res: WriteResult = await resolved_backend.awrite(validated_path, content)
             if res.error:
                 return res.error
             # If backend returns state update, wrap into Command with ToolMessage
@@ -603,7 +706,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Synchronous wrapper for edit_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            res: EditResult = resolved_backend.edit(validated_path, old_string, new_string, replace_all=replace_all, runtime=runtime)
+            res: EditResult = resolved_backend.edit(validated_path, old_string, new_string, replace_all=replace_all)
             if res.error:
                 return res.error
             if res.files_update is not None:
@@ -631,7 +734,7 @@ class FilesystemMiddleware(AgentMiddleware):
             """Asynchronous wrapper for edit_file tool."""
             resolved_backend = self._get_backend(runtime)
             validated_path = _validate_path(file_path)
-            res: EditResult = await resolved_backend.aedit(validated_path, old_string, new_string, replace_all=replace_all, runtime=runtime)
+            res: EditResult = await resolved_backend.aedit(validated_path, old_string, new_string, replace_all=replace_all)
             if res.error:
                 return res.error
             if res.files_update is not None:
@@ -666,7 +769,7 @@ class FilesystemMiddleware(AgentMiddleware):
         ) -> str:
             """Synchronous wrapper for glob tool."""
             resolved_backend = self._get_backend(runtime)
-            infos = resolved_backend.glob_info(pattern, path=path, runtime=runtime)
+            infos = resolved_backend.glob_info(pattern, path=path)
             paths = [fi.get("path", "") for fi in infos]
             result = truncate_if_too_long(paths)
             return str(result)
@@ -678,7 +781,7 @@ class FilesystemMiddleware(AgentMiddleware):
         ) -> str:
             """Asynchronous wrapper for glob tool."""
             resolved_backend = self._get_backend(runtime)
-            infos = await resolved_backend.aglob_info(pattern, path=path, runtime=runtime)
+            infos = await resolved_backend.aglob_info(pattern, path=path)
             paths = [fi.get("path", "") for fi in infos]
             result = truncate_if_too_long(paths)
             return str(result)
@@ -710,7 +813,7 @@ class FilesystemMiddleware(AgentMiddleware):
             if isinstance(raw, str):
                 return raw
             formatted = format_grep_matches(raw, output_mode)
-            return truncate_if_too_long(formatted)  # type: ignore[arg-type]
+            return truncate_if_too_long(formatted)
 
         async def async_grep(
             pattern: Annotated[str, "Text pattern to search for (literal string, not regex)."],
@@ -728,7 +831,7 @@ class FilesystemMiddleware(AgentMiddleware):
             if isinstance(raw, str):
                 return raw
             formatted = format_grep_matches(raw, output_mode)
-            return truncate_if_too_long(formatted)  # type: ignore[arg-type]
+            return truncate_if_too_long(formatted)
 
         return StructuredTool.from_function(
             name="grep",
@@ -737,15 +840,24 @@ class FilesystemMiddleware(AgentMiddleware):
             coroutine=async_grep,
         )
 
-    def _create_execute_tool(self) -> BaseTool:
+    def _create_execute_tool(self) -> BaseTool:  # noqa: C901
         """Create the execute tool for sandbox command execution."""
         tool_description = self._custom_tool_descriptions.get("execute") or EXECUTE_TOOL_DESCRIPTION
 
         def sync_execute(
             command: Annotated[str, "Shell command to execute in the sandbox environment."],
             runtime: ToolRuntime[None, FilesystemState],
+            timeout: Annotated[
+                int | None, "Optional timeout in seconds for this command. Overrides the default timeout. Use for long-running commands."
+            ] = None,
         ) -> str:
             """Synchronous wrapper for execute tool."""
+            if timeout is not None and timeout <= 0:
+                return f"Error: timeout must be positive, got {timeout}."
+
+            if timeout is not None and timeout > self._max_execute_timeout:
+                return f"Error: timeout {timeout}s exceeds maximum allowed ({self._max_execute_timeout}s)."
+
             resolved_backend = self._get_backend(runtime)
 
             # Runtime check - fail gracefully if not supported
@@ -756,11 +868,16 @@ class FilesystemMiddleware(AgentMiddleware):
                     "To use the execute tool, provide a backend that implements SandboxBackendProtocol."
                 )
 
+            # Safe cast: _supports_execution validates that execute()/aexecute() exist
+            # (either SandboxBackendProtocol or CompositeBackend with sandbox default)
+            executable = cast("SandboxBackendProtocol", resolved_backend)
             try:
-                result = resolved_backend.execute(command)
+                result = executable.execute(command, timeout=timeout)
             except NotImplementedError as e:
                 # Handle case where execute() exists but raises NotImplementedError
                 return f"Error: Execution not available. {e}"
+            except ValueError as e:
+                return f"Error: Invalid parameter. {e}"
 
             # Format output for LLM consumption
             parts = [result.output]
@@ -777,8 +894,19 @@ class FilesystemMiddleware(AgentMiddleware):
         async def async_execute(
             command: Annotated[str, "Shell command to execute in the sandbox environment."],
             runtime: ToolRuntime[None, FilesystemState],
+            # ASYNC109 - timeout is a semantic parameter forwarded to the
+            # backend's implementation, not an asyncio.timeout() contract.
+            timeout: Annotated[  # noqa: ASYNC109
+                int | None, "Optional timeout in seconds for this command. Overrides the default timeout. Use for long-running commands."
+            ] = None,
         ) -> str:
             """Asynchronous wrapper for execute tool."""
+            if timeout is not None and timeout <= 0:
+                return f"Error: timeout must be positive, got {timeout}."
+
+            if timeout is not None and timeout > self._max_execute_timeout:
+                return f"Error: timeout {timeout}s exceeds maximum allowed ({self._max_execute_timeout}s)."
+
             resolved_backend = self._get_backend(runtime)
 
             # Runtime check - fail gracefully if not supported
@@ -789,11 +917,15 @@ class FilesystemMiddleware(AgentMiddleware):
                     "To use the execute tool, provide a backend that implements SandboxBackendProtocol."
                 )
 
+            # Safe cast: _supports_execution validates that execute()/aexecute() exist
+            executable = cast("SandboxBackendProtocol", resolved_backend)
             try:
-                result = await resolved_backend.aexecute(command)
+                result = await executable.aexecute(command, timeout=timeout)
             except NotImplementedError as e:
                 # Handle case where execute() exists but raises NotImplementedError
                 return f"Error: Execution not available. {e}"
+            except ValueError as e:
+                return f"Error: Invalid parameter. {e}"
 
             # Format output for LLM consumption
             parts = [result.output]
@@ -816,9 +948,9 @@ class FilesystemMiddleware(AgentMiddleware):
 
     def wrap_model_call(
         self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], ModelResponse],
-    ) -> ModelResponse:
+        request: ModelRequest[ContextT],
+        handler: Callable[[ModelRequest[ContextT]], ModelResponse[ResponseT]],
+    ) -> ModelResponse[ResponseT]:
         """Update the system prompt and filter tools based on backend capabilities.
 
         Args:
@@ -834,7 +966,7 @@ class FilesystemMiddleware(AgentMiddleware):
         backend_supports_execution = False
         if has_execute_tool:
             # Resolve backend to check execution support
-            backend = self._get_backend(request.runtime)
+            backend = self._get_backend(request.runtime)  # ty: ignore[invalid-argument-type]
             backend_supports_execution = _supports_execution(backend)
 
             # If execute tool exists but backend doesn't support it, filter it out
@@ -854,7 +986,7 @@ class FilesystemMiddleware(AgentMiddleware):
             if has_execute_tool and backend_supports_execution:
                 prompt_parts.append(EXECUTION_SYSTEM_PROMPT)
 
-            system_prompt = "\n\n".join(prompt_parts)
+            system_prompt = "\n\n".join(prompt_parts).strip()
 
         if system_prompt:
             new_system_message = append_to_system_message(request.system_message, system_prompt)
@@ -864,9 +996,9 @@ class FilesystemMiddleware(AgentMiddleware):
 
     async def awrap_model_call(
         self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-    ) -> ModelResponse:
+        request: ModelRequest[ContextT],
+        handler: Callable[[ModelRequest[ContextT]], Awaitable[ModelResponse[ResponseT]]],
+    ) -> ModelResponse[ResponseT]:
         """(async) Update the system prompt and filter tools based on backend capabilities.
 
         Args:
@@ -882,7 +1014,7 @@ class FilesystemMiddleware(AgentMiddleware):
         backend_supports_execution = False
         if has_execute_tool:
             # Resolve backend to check execution support
-            backend = self._get_backend(request.runtime)
+            backend = self._get_backend(request.runtime)  # ty: ignore[invalid-argument-type]
             backend_supports_execution = _supports_execution(backend)
 
             # If execute tool exists but backend doesn't support it, filter it out
@@ -902,7 +1034,7 @@ class FilesystemMiddleware(AgentMiddleware):
             if has_execute_tool and backend_supports_execution:
                 prompt_parts.append(EXECUTION_SYSTEM_PROMPT)
 
-            system_prompt = "\n\n".join(prompt_parts)
+            system_prompt = "\n\n".join(prompt_parts).strip()
 
         if system_prompt:
             new_system_message = append_to_system_message(request.system_message, system_prompt)
@@ -1092,7 +1224,8 @@ class FilesystemMiddleware(AgentMiddleware):
                 if files_update is not None:
                     accumulated_file_updates.update(files_update)
             return Command(update={**update, "messages": processed_messages, "files": accumulated_file_updates})
-        raise AssertionError(f"Unreachable code reached in _intercept_large_tool_result: for tool_result of type {type(tool_result)}")
+        msg = f"Unreachable code reached in _intercept_large_tool_result: for tool_result of type {type(tool_result)}"
+        raise AssertionError(msg)
 
     async def _aintercept_large_tool_result(self, tool_result: ToolMessage | Command, runtime: ToolRuntime) -> ToolMessage | Command:
         """Async version of _intercept_large_tool_result.
@@ -1138,7 +1271,8 @@ class FilesystemMiddleware(AgentMiddleware):
                 if files_update is not None:
                     accumulated_file_updates.update(files_update)
             return Command(update={**update, "messages": processed_messages, "files": accumulated_file_updates})
-        raise AssertionError(f"Unreachable code reached in _aintercept_large_tool_result: for tool_result of type {type(tool_result)}")
+        msg = f"Unreachable code reached in _aintercept_large_tool_result: for tool_result of type {type(tool_result)}"
+        raise AssertionError(msg)
 
     def wrap_tool_call(
         self,
