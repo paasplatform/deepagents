@@ -30,6 +30,7 @@ from deepagents.backends.protocol import (
     EditResult,
     SandboxBackendProtocol,
     WriteResult,
+    execute_accepts_timeout,
 )
 from deepagents.backends.types import FileData, FilesystemState
 from deepagents.backends.utils import (
@@ -844,7 +845,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         """Create the execute tool for sandbox command execution."""
         tool_description = self._custom_tool_descriptions.get("execute") or EXECUTE_TOOL_DESCRIPTION
 
-        def sync_execute(
+        def sync_execute(  # noqa: PLR0911 - early returns for distinct error conditions
             command: Annotated[str, "Shell command to execute in the sandbox environment."],
             runtime: ToolRuntime[None, FilesystemState],
             timeout: Annotated[
@@ -852,11 +853,11 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             ] = None,
         ) -> str:
             """Synchronous wrapper for execute tool."""
-            if timeout is not None and timeout <= 0:
-                return f"Error: timeout must be positive, got {timeout}."
-
-            if timeout is not None and timeout > self._max_execute_timeout:
-                return f"Error: timeout {timeout}s exceeds maximum allowed ({self._max_execute_timeout}s)."
+            if timeout is not None:
+                if timeout <= 0:
+                    return f"Error: timeout must be positive, got {timeout}."
+                if timeout > self._max_execute_timeout:
+                    return f"Error: timeout {timeout}s exceeds maximum allowed ({self._max_execute_timeout}s)."
 
             resolved_backend = self._get_backend(runtime)
 
@@ -871,8 +872,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             # Safe cast: _supports_execution validates that execute()/aexecute() exist
             # (either SandboxBackendProtocol or CompositeBackend with sandbox default)
             executable = cast("SandboxBackendProtocol", resolved_backend)
+            if timeout is not None and not execute_accepts_timeout(type(executable)):
+                return (
+                    "Error: This sandbox backend does not support per-command "
+                    "timeout overrides. Update your sandbox package to the "
+                    "latest version, or omit the timeout parameter."
+                )
             try:
-                result = executable.execute(command, timeout=timeout)
+                result = executable.execute(command, timeout=timeout) if timeout is not None else executable.execute(command)
             except NotImplementedError as e:
                 # Handle case where execute() exists but raises NotImplementedError
                 return f"Error: Execution not available. {e}"
@@ -891,7 +898,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
             return "".join(parts)
 
-        async def async_execute(
+        async def async_execute(  # noqa: PLR0911 - early returns for distinct error conditions
             command: Annotated[str, "Shell command to execute in the sandbox environment."],
             runtime: ToolRuntime[None, FilesystemState],
             # ASYNC109 - timeout is a semantic parameter forwarded to the
@@ -901,11 +908,11 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
             ] = None,
         ) -> str:
             """Asynchronous wrapper for execute tool."""
-            if timeout is not None and timeout <= 0:
-                return f"Error: timeout must be positive, got {timeout}."
-
-            if timeout is not None and timeout > self._max_execute_timeout:
-                return f"Error: timeout {timeout}s exceeds maximum allowed ({self._max_execute_timeout}s)."
+            if timeout is not None:
+                if timeout <= 0:
+                    return f"Error: timeout must be positive, got {timeout}."
+                if timeout > self._max_execute_timeout:
+                    return f"Error: timeout {timeout}s exceeds maximum allowed ({self._max_execute_timeout}s)."
 
             resolved_backend = self._get_backend(runtime)
 
@@ -919,8 +926,14 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
 
             # Safe cast: _supports_execution validates that execute()/aexecute() exist
             executable = cast("SandboxBackendProtocol", resolved_backend)
+            if timeout is not None and not execute_accepts_timeout(type(executable)):
+                return (
+                    "Error: This sandbox backend does not support per-command "
+                    "timeout overrides. Update your sandbox package to the "
+                    "latest version, or omit the timeout parameter."
+                )
             try:
-                result = await executable.aexecute(command, timeout=timeout)
+                result = await executable.aexecute(command, timeout=timeout) if timeout is not None else await executable.aexecute(command)
             except NotImplementedError as e:
                 # Handle case where execute() exists but raises NotImplementedError
                 return f"Error: Execution not available. {e}"
